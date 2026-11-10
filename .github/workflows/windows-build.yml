@@ -55,22 +55,30 @@ jobs:
         run: |
           git config --global core.longpaths true
 
-          # LLVM 23 or newer (docs/BUILDING.md), at the path runtime\scripts\env.cmd looks for
+          # LLVM 23 or newer (docs/BUILDING.md), at the path runtime\scripts\env.cmd looks for.
+          # clang prints its version banner on stderr (PrintVersion(C, llvm::errs()) in Driver.cpp): merge it with 2>&1.
           $clang = 'C:\Program Files\LLVM\bin\clang-cl.exe'
-          function ClangMajor {
-            if (-not (Test-Path $clang)) { return 0 }
-            $m = & $clang --version | Select-String 'clang-cl version (\d+)'
-            if ($m) { return [int]$m.Matches[0].Groups[1].Value }
+          function Read-Clang {
+            if (-not (Test-Path $clang)) { return '' }
+            try { return ((& $clang --version 2>&1 | ForEach-Object { "$_" }) -join "`n").Trim() }
+            catch { return "failed to run: $_" }
+          }
+          function ClangMajor([string]$out) {
+            if ($out -match 'version\s+(\d+)\.') { return [int]$Matches[1] }
+            if ($out -match '\b(\d+)\.\d+\.\d+') { return [int]$Matches[1] }
             return 0
           }
-          if ((ClangMajor) -lt 23) {
-            Write-Host 'installing LLVM: clang-cl 23 or newer is required'
+          $ver = Read-Clang
+          if ((ClangMajor $ver) -lt 23) {
+            Write-Host "installing LLVM: clang-cl 23+ required, current: $(($ver -split "`n")[0])"
             choco upgrade llvm -y --no-progress
             if ($LASTEXITCODE -notin 0, 3010) { throw "choco upgrade llvm failed ($LASTEXITCODE)" }
+            $ver = Read-Clang
           }
-          if ((ClangMajor) -lt 23) { throw "clang-cl 23+ not found at $clang" }
+          if ((ClangMajor $ver) -lt 23) { throw "clang-cl 23+ not verified at $clang - version output:`n$ver" }
           Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files\LLVM\bin'
-          & $clang --version
+          Write-Host 'clang-cl:'
+          & $clang --version 2>&1 | ForEach-Object { Write-Host "  $_" }
 
           # NASM: dav1d's x86-64 assembly (without it dav1d builds C-only)
           if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
