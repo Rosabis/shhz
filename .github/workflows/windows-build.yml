@@ -1,0 +1,167 @@
+# Builds the Windows release zip fefw-recomp-<version>-win64.zip on a clean runner, following
+# docs/BUILDING.md. No game dump is needed (and none may end up in the package): the zip carries only
+# the runtime DLL, the launcher, the shader translator and the bundled build tools; the player's PC
+# lifts fefw.exe from their own dump (see game-build/scripts/make-release.ps1).
+#
+#   Actions tab > Windows build > Run workflow   (optional version input; artifact only)
+#   git tag v0.1.6 && git push origin v0.1.6     (builds and publishes a GitHub release)
+name: Windows build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version for the zip (empty: tag name without 'v', else launcher package.json)"
+        required: false
+        default: ""
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # publishing the release when a tag is pushed
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      NX_JOBS: "4" # compile processes; the hosted runner has 4 vCPU / 16 GB
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $v = $env:INPUT_VERSION
+          if (-not $v -and $env:REF_TYPE -eq 'tag') { $v = $env:REF_NAME.TrimStart('v') }
+          if (-not $v) { $v = (Get-Content 'launcher\package.json' -Raw | ConvertFrom-Json).version }
+          if (-not $v) { throw 'could not determine the version' }
+          "version=$v" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding utf8
+          Write-Host "version: $v"
+
+      - name: Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Toolchain (LLVM 23+, NASM, Rust)
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+
+          # LLVM 23 or newer (docs/BUILDING.md), at the path runtime\scripts\env.cmd looks for
+          $clang = 'C:\Program Files\LLVM\bin\clang-cl.exe'
+          function ClangMajor {
+            if (-not (Test-Path $clang)) { return 0 }
+            $m = & $clang --version | Select-String 'clang-cl version (\d+)'
+            if ($m) { return [int]$m.Matches[0].Groups[1].Value }
+            return 0
+          }
+          if ((ClangMajor) -lt 23) {
+            Write-Host 'installing LLVM: clang-cl 23 or newer is required'
+            choco upgrade llvm -y --no-progress
+            if ($LASTEXITCODE -notin 0, 3010) { throw "choco upgrade llvm failed ($LASTEXITCODE)" }
+          }
+          if ((ClangMajor) -lt 23) { throw "clang-cl 23+ not found at $clang" }
+          Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files\LLVM\bin'
+          & $clang --version
+
+          # NASM: dav1d's x86-64 assembly (without it dav1d builds C-only)
+          if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+            choco install nasm -y --no-progress
+            if ($LASTEXITCODE -notin 0, 3010) { throw "choco install nasm failed ($LASTEXITCODE)" }
+          }
+          $nasm = Get-ChildItem 'C:\Program Files*\nasm\nasm.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($nasm) { Add-Content -Path $env:GITHUB_PATH -Value $nasm.DirectoryName; $env:PATH = "$($nasm.DirectoryName);$env:PATH" }
+          if (Get-Command nasm -ErrorAction SilentlyContinue) { nasm -v } else { Write-Host 'nasm not found: dav1d assembly off' }
+
+          # Rust stable for the Tauri launcher (make-release.ps1 runs npm + cargo)
+          if (Get-Command rustup -ErrorAction SilentlyContinue) {
+            rustup default stable
+            if ($LASTEXITCODE) { throw "rustup default stable failed ($LASTEXITCODE)" }
+          } else {
+            Invoke-WebRequest -UseBasicParsing https://win.rustup.rs/x86_64 -OutFile "$env:TEMP\rustup-init.exe"
+            & "$env:TEMP\rustup-init.exe" -y --default-toolchain stable --profile minimal
+            if ($LASTEXITCODE) { throw "rustup-init failed ($LASTEXITCODE)" }
+          }
+          cargo --version
+          cmake --version
+          ninja --version
+
+      - name: libvpx (host video decoders)
+        shell: pwsh
+        run: |
+          # vcpkg x64-windows-static, static /MT like everything else (runtime\cmake\media_deps.cmake)
+          $exe = $null
+          if ($env:VCPKG_ROOT -and (Test-Path (Join-Path $env:VCPKG_ROOT 'vcpkg.exe'))) { $exe = Join-Path $env:VCPKG_ROOT 'vcpkg.exe' }
+          else { $exe = (Get-Command vcpkg -ErrorAction SilentlyContinue).Source }
+          if (-not $exe) {
+            Write-Host '::warning::vcpkg not found: the runtime builds without the host video decoders (NXRT_HAVE_LIBVPX=0)'
+            exit 0
+          }
+          & $exe install libvpx:x64-windows-static
+          if ($LASTEXITCODE) { throw "vcpkg install libvpx failed ($LASTEXITCODE)" }
+
+      - name: Texture transcoder sources (astc-encoder, bc7enc_rdo)
+        shell: pwsh
+        run: |
+          & 'tools\textures\scripts\fetch_third_party.ps1'
+          if (-not (Test-Path 'tools\textures\third_party\astc-encoder\Source\astcenc.h')) { throw 'astc-encoder sources missing' }
+
+      - name: Shader translator sources (Ryujinx, pinned revision)
+        shell: pwsh
+        run: |
+          git clone --filter=blob:none --no-checkout https://git.ryujinx.app/ryubing/ryujinx.git work\refs\ryubing
+          if ($LASTEXITCODE) { throw "git clone failed ($LASTEXITCODE)" }
+          git -C work\refs\ryubing checkout a82350bb774f70fcbd41c9987bf67a3775409963
+          if ($LASTEXITCODE) { throw "git checkout failed ($LASTEXITCODE)" }
+          & 'tools\shaders\scripts\setup_ryujinx.ps1' -Ryubing 'work\refs\ryubing'
+          if (-not (Test-Path 'tools\shaders\third_party\ryubing\src\Ryujinx.Graphics.Shader')) { throw 'Ryujinx sources not staged' }
+
+      - name: .NET SDK (pinned by the translator's global.json)
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: tools/shaders/third_party/ryubing/global.json
+
+      - name: Build fefw_rt.dll (the runtime of the release package)
+        shell: pwsh
+        run: |
+          & 'game-build\scripts\build_fefw.ps1' -Target fefw_rt -BuildDir build\rtdll -CMakeArgs "-DFEFW_RT_DLL=ON"
+          if ($LASTEXITCODE) { throw "fefw_rt build failed ($LASTEXITCODE)" }
+          if (-not (Test-Path 'game-build\fefw\build\rtdll\fefw_rt.dll')) { throw 'fefw_rt.dll missing' }
+
+      - name: Package the release zip
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          & 'game-build\scripts\make-release.ps1' -Version $env:VERSION
+          if (-not (Get-Item "work\release\fefw-recomp-$env:VERSION-win64.zip" -ErrorAction SilentlyContinue)) { throw 'release zip missing' }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fefw-recomp-${{ steps.ver.outputs.version }}-win64
+          path: work/release/fefw-recomp-*-win64.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub release (tags only)
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $zip = (Get-Item 'work\release\fefw-recomp-*-win64.zip').FullName
+          gh release view $env:GITHUB_REF_NAME *> $null
+          if ($LASTEXITCODE) {
+            gh release create $env:GITHUB_REF_NAME $zip --title "fefw-recomp $env:GITHUB_REF_NAME" --generate-notes
+          } else {
+            gh release upload $env:GITHUB_REF_NAME $zip --clobber
+          }
+          if ($LASTEXITCODE) { throw "gh release failed ($LASTEXITCODE)" }
